@@ -33,13 +33,20 @@ NMCONF
 iw dev wlan0 set power_save off 2>/dev/null || true
 echo "[✓] Disabled NetworkManager & iw Wi-Fi power saving"
 
-# 4. Lock active wlan0 connection to current router BSSID to prevent SDIO scan hangs
+# 4. Lock active wlan0 connection to 2.4 GHz (bg) and current BSSID to prevent 5 GHz drops
 if command -v nmcli >/dev/null 2>&1 && command -v iw >/dev/null 2>&1; then
   CON_NAME=$(nmcli -t -f NAME,DEVICE con show --active | grep ':wlan0$' | cut -d: -f1)
-  BSSID=$(iw dev wlan0 link 2>/dev/null | awk '/Connected to/ {print $3}')
-  if [ -n "$CON_NAME" ] && [ -n "$BSSID" ]; then
-    nmcli con modify "$CON_NAME" 802-11-wireless.bssid "$BSSID" 2>/dev/null || true
-    echo "[✓] Locked '$CON_NAME' to BSSID $BSSID (disables background roaming scans)"
+  if [ -n "$CON_NAME" ]; then
+    nmcli con modify "$CON_NAME" 802-11-wireless.band bg 802-11-wireless.bssid "" 2>/dev/null || true
+    nmcli con up "$CON_NAME" >/dev/null 2>&1 || true
+    sleep 2
+    BSSID=$(iw dev wlan0 link 2>/dev/null | awk '/Connected to/ {print $3}')
+    if [ -n "$BSSID" ]; then
+      nmcli con modify "$CON_NAME" 802-11-wireless.bssid "$BSSID" 2>/dev/null || true
+      echo "[✓] Locked '$CON_NAME' to 2.4 GHz (bg) and BSSID $BSSID"
+    else
+      echo "[✓] Locked '$CON_NAME' to 2.4 GHz (bg)"
+    fi
   fi
 fi
 
@@ -52,12 +59,17 @@ install -m 0755 wifi-watchdog.sh /usr/local/sbin/wifi-watchdog.sh
 (crontab -l 2>/dev/null | grep -v wifi-watchdog; echo "*/3 * * * * /usr/local/sbin/wifi-watchdog.sh") | crontab -
 echo "[✓] Installed /usr/local/sbin/wifi-watchdog.sh (runs every 3 minutes)"
 
-# 7. SSH IPQoS Fix, Custom Port & Fail2Ban Hardening
+# 7. SSH IPQoS, Keepalives, Custom Port & Fail2Ban Hardening
 mkdir -p /etc/ssh/sshd_config.d
+cat << 'KEEPALIVE' > /etc/ssh/sshd_config.d/96-keepalive.conf
+ClientAliveInterval 30
+ClientAliveCountMax 5
+KEEPALIVE
+
 cat << 'QOSCONF' > /etc/ssh/sshd_config.d/98-ipqos.conf
 IPQoS cs0 cs0
 QOSCONF
-echo "[✓] Configured SSH IPQoS cs0 cs0 (prevents router packet drops)"
+echo "[✓] Configured SSH IPQoS cs0 cs0 & Keepalives (30s interval)"
 
 echo ""
 RAND_PORT=$((49152 + RANDOM % 16383))
