@@ -52,7 +52,13 @@ install -m 0755 wifi-watchdog.sh /usr/local/sbin/wifi-watchdog.sh
 (crontab -l 2>/dev/null | grep -v wifi-watchdog; echo "*/3 * * * * /usr/local/sbin/wifi-watchdog.sh") | crontab -
 echo "[✓] Installed /usr/local/sbin/wifi-watchdog.sh (runs every 3 minutes)"
 
-# 7. SSH Custom Port & Fail2Ban Hardening
+# 7. SSH IPQoS Fix, Custom Port & Fail2Ban Hardening
+mkdir -p /etc/ssh/sshd_config.d
+cat << 'QOSCONF' > /etc/ssh/sshd_config.d/98-ipqos.conf
+IPQoS cs0 cs0
+QOSCONF
+echo "[✓] Configured SSH IPQoS cs0 cs0 (prevents router packet drops)"
+
 echo ""
 RAND_PORT=$((49152 + RANDOM % 16383))
 read -r -p "Change SSH port to reduce scanner noise? Enter port [1024-65535], Enter for [$RAND_PORT], or 'n' to skip: " INPUT_PORT </dev/tty || INPUT_PORT="n"
@@ -61,7 +67,6 @@ SSH_PORT=22
 if [[ "$INPUT_PORT" != "n" && "$INPUT_PORT" != "N" ]]; then
   SSH_PORT="${INPUT_PORT:-$RAND_PORT}"
   if [[ "$SSH_PORT" =~ ^[0-9]+$ ]] && [ "$SSH_PORT" -ge 1024 ] && [ "$SSH_PORT" -le 65535 ]; then
-    mkdir -p /etc/ssh/sshd_config.d
     cat << SSHCONF > /etc/ssh/sshd_config.d/99-custom-port.conf
 Port $SSH_PORT
 SSHCONF
@@ -71,16 +76,17 @@ SSHCONF
       ufw allow "$SSH_PORT"/tcp >/dev/null 2>&1 || true
     fi
 
-    sshd -t
-    systemctl daemon-reload
-    systemctl restart ssh.socket 2>/dev/null || true
-    systemctl restart ssh
     echo "[✓] SSH port changed to $SSH_PORT"
   else
     echo "[!] Invalid port '$SSH_PORT' — keeping port 22"
     SSH_PORT=22
   fi
 fi
+
+sshd -t
+systemctl daemon-reload
+systemctl restart ssh.socket 2>/dev/null || true
+systemctl restart ssh
 
 # Install & configure Fail2Ban for the active SSH port
 if ! command -v fail2ban-client >/dev/null 2>&1; then
@@ -106,7 +112,38 @@ systemctl enable --now fail2ban >/dev/null 2>&1
 systemctl restart fail2ban
 echo "[✓] Fail2Ban active on SSH port $SSH_PORT (whitelisted LAN: $SUBNET)"
 
-# 8. Update initramfs so modprobe options persist at early boot
+# 8. Blacklist broken audio drivers & silence kernel log spam
+cat << 'AUDIOCONF' > /etc/modprobe.d/blacklist-audio.conf
+blacklist snd_soc_simple_card
+blacklist snd_soc_core
+AUDIOCONF
+
+if [ -d /etc/rsyslog.d ]; then
+  echo ':msg, contains, "simple_dai_link_of failed" stop' > /etc/rsyslog.d/01-block-audio.conf
+  systemctl restart rsyslog 2>/dev/null || true
+fi
+echo "[✓] Blacklisted broken audio modules & silenced rsyslog spam"
+
+# 9. Cap journald size & expand ramlog from 50M to 256M
+sed -i 's/.*SystemMaxUse.*/SystemMaxUse=20M/' /etc/systemd/journald.conf
+if ! grep -q "SystemMaxUse=20M" /etc/systemd/journald.conf; then
+  echo "SystemMaxUse=20M" >> /etc/systemd/journald.conf
+fi
+systemctl restart systemd-journald
+journalctl --vacuum-size=5M >/dev/null 2>&1 || true
+[ -f /var/log/syslog ] && > /var/log/syslog
+
+if [ -f /etc/default/orangepi-ramlog ]; then
+  sed -i 's/^SIZE=.*/SIZE=256M/' /etc/default/orangepi-ramlog
+  echo "[✓] Capped journald to 20M & expanded orangepi-ramlog to 256M"
+elif [ -f /etc/default/armbian-ramlog ]; then
+  sed -i 's/^SIZE=.*/SIZE=256M/' /etc/default/armbian-ramlog
+  echo "[✓] Capped journald to 20M & expanded armbian-ramlog to 256M"
+else
+  echo "[✓] Capped journald to 20M"
+fi
+
+# 10. Update initramfs so modprobe options persist at early boot
 if command -v update-initramfs >/dev/null 2>&1; then
   echo "[*] Updating initramfs..."
   update-initramfs -u
@@ -114,7 +151,7 @@ if command -v update-initramfs >/dev/null 2>&1; then
 fi
 
 echo ""
-echo "[✓] Setup complete! Reboot once ('sudo reboot') to apply all driver flags."
+echo "[✓] Setup complete! Reboot once ('sudo reboot') to apply all driver flags & ramlog size."
 if [ "$SSH_PORT" -ne 22 ]; then
   echo "[!] Remember to connect with: ssh -p $SSH_PORT root@$(hostname -I | awk '{print $1}')"
 fi
